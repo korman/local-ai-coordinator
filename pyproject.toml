@@ -1,7 +1,11 @@
 [project]
 name = "local-ai-coordinator"
 version = "0.1.0"
-description = "Add your description here"
+description = "阿里云端协调器 - 接收前端/APP请求，通过 NATS 转发给本地 AI Worker (local-ai-worker)"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
+authors = [
+    { name = "郭浩" }
+]
+license = { text = "MIT" }
 dependencies = []
