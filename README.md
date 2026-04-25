@@ -55,4 +55,4 @@ cp .env.example .env
 # 编辑 .env 文件，填入正确的 NATS_URL
 
 # 4. 运行服务
-uv run uvicorn app.main:app --host 0.0.0.0 --port 3000 --reload
+uv run uvicorn main:app --host 0.0.0.0 --port 3000 --reload
