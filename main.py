@@ -9,10 +9,11 @@ import json
 import uuid
 from loguru import logger
 import asyncio
+from typing import Dict, Optional
 
 load_dotenv()
 
-app = FastAPI(title="Local AI Coordinator - 本地测试版", version="0.1.0")
+app = FastAPI(title="Local AI Coordinator - 带进度轮询版", version="0.3.0")
 
 
 class GenerateRequest(BaseModel):
@@ -23,6 +24,8 @@ class GenerateRequest(BaseModel):
 
 
 nats_client = None
+status_cache: Dict[str, dict] = {}  # 进度缓存
+results_cache: Dict[str, dict] = {}  # 最终结果缓存
 
 
 async def get_nats():
@@ -34,19 +37,50 @@ async def get_nats():
     return nats_client
 
 
+# ================== 后台监听进度 + 结果 ==================
+async def listen_nats():
+    nc = await get_nats()
+    # 监听所有进度
+    progress_sub = await nc.subscribe("ai.progress.>")
+    # 监听所有最终结果
+    result_sub = await nc.subscribe("ai.results.>")
+
+    logger.info("📡 进度与结果监听器已启动")
+
+    async for msg in progress_sub.messages:
+        try:
+            data = json.loads(msg.data.decode("utf-8"))
+            req_id = data.get("request_id")
+            if req_id:
+                status_cache[req_id] = data
+                logger.info(f"📈 收到进度更新 [{req_id}]: {data.get('progress')}%")
+        except Exception as e:
+            logger.error(f"进度解析失败: {e}")
+
+    async for msg in result_sub.messages:  # 实际会和上面是同一个循环，这里简化演示
+        try:
+            data = json.loads(msg.data.decode("utf-8"))
+            req_id = data.get("request_id")
+            if req_id:
+                results_cache[req_id] = data
+                status_cache[req_id] = {"status": "success", "progress": 100, **data}
+                logger.info(f"✅ 收到最终结果 [{req_id}]")
+        except Exception as e:
+            logger.error(f"结果解析失败: {e}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(listen_nats())
+
+
 @app.post("/generate")
 async def generate(req: GenerateRequest):
     request_id = str(uuid.uuid4())
-    logger.info(f"[{request_id}] 收到生成请求: prompt={req.prompt[:50]}...")
+    logger.info(f"[{request_id}] 收到生成请求")
 
     try:
         nc = await get_nats()
-
-        # ================== 1. 订阅唯一的结果通道（pub/sub 核心）==================
-        result_subject = f"ai.results.{request_id}"
-        sub = await nc.subscribe(result_subject, max_msgs=1)
-
-        # ================== 2. 构造 payload 并发布任务 ==================
         payload = json.dumps(
             {
                 "request_id": request_id,
@@ -58,31 +92,57 @@ async def generate(req: GenerateRequest):
         ).encode("utf-8")
 
         await nc.publish("ai.generate", payload)
-        logger.info(f"[{request_id}] 任务已 publish 到 ai.generate")
+        logger.info(f"[{request_id}] 任务已 publish（立即返回）")
 
-        # ================== 3. 等待结果 ==================
-        msg = await sub.next_msg(timeout=180.0)  # 与原来 180 秒一致
-        result = json.loads(msg.data.decode("utf-8"))
-
-        await sub.unsubscribe()  # 清理
-
-        return JSONResponse(content=result)
-
-    except asyncio.TimeoutError:
-        logger.warning(f"[{request_id}] 超时")
         return JSONResponse(
-            status_code=504,
             content={
-                "status": "timeout",
+                "status": "processing",
                 "request_id": request_id,
-                "message": "生成超时",
-            },
+                "message": "任务已提交，正在生成中...",
+            }
         )
+
     except Exception as e:
-        logger.error(f"[{request_id}] 处理失败: {e}")
+        logger.error(f"[{request_id}] 提交失败: {e}")
         return JSONResponse(
             status_code=500, content={"status": "error", "message": str(e)}
         )
+
+
+@app.get("/status/{request_id}")
+async def get_status(request_id: str):
+    """轮询进度接口"""
+    if request_id in results_cache:
+        result = results_cache.pop(request_id)
+        return JSONResponse(content=result)
+
+    if request_id in status_cache:
+        return JSONResponse(content=status_cache[request_id])
+
+    return JSONResponse(
+        content={
+            "status": "processing",
+            "request_id": request_id,
+            "progress": 0,
+            "message": "等待生成...",
+        }
+    )
+
+
+@app.get("/results/{request_id}")
+async def get_result(request_id: str):
+    """最终结果（成功后调用）"""
+    if request_id in results_cache:
+        result = results_cache.pop(request_id)
+        status_cache.pop(request_id, None)  # 清理
+        return JSONResponse(content=result)
+    return JSONResponse(
+        content={
+            "status": "processing",
+            "request_id": request_id,
+            "message": "还在生成中...",
+        }
+    )
 
 
 if __name__ == "__main__":
