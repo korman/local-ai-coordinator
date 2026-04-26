@@ -1,9 +1,9 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict  # ← 关键：新增 ConfigDict
 import uvicorn
 import os
 from dotenv import load_dotenv
-import asyncio
 import nats
 import json
 import uuid
@@ -11,7 +11,18 @@ from loguru import logger
 
 load_dotenv()
 
-app = FastAPI(title="Local AI Coordinator")
+app = FastAPI(title="Local AI Coordinator - 本地测试版", version="0.1.0")
+
+
+# ================== Pydantic v2 正确写法（关键修复）==================
+class GenerateRequest(BaseModel):
+    prompt: str = "中文流行，情感，男声，钢琴"
+    lyrics: str = "夜雨敲打着东京的窗\n霓虹灯下我一个人彷徨"
+    tags: str = "chinese pop, emotional, male vocal, piano"
+
+    # Pydantic v2 正确配置方式
+    model_config = ConfigDict(extra="allow")
+
 
 nats_client = None
 
@@ -26,33 +37,24 @@ async def get_nats():
 
 
 @app.post("/generate")
-async def generate(request: Request):
-    data = await request.json()
+async def generate(req: GenerateRequest):
     request_id = str(uuid.uuid4())
-
-    logger.info(f"[{request_id}] 收到生成请求")
+    logger.info(f"[{request_id}] 收到生成请求: prompt={req.prompt[:50]}...")
 
     try:
         nc = await get_nats()
 
-        # 转发给本地 Rust Worker
-        reply_subject = f"ai.reply.{request_id}"
+        payload = json.dumps(
+            {
+                "request_id": request_id,
+                "prompt": req.prompt,
+                "lyrics": req.lyrics,
+                "tags": req.tags,
+                **req.model_dump(),
+            }
+        ).encode("utf-8")
 
-        await nc.publish(
-            "ai.generate",
-            json.dumps(
-                {
-                    "request_id": request_id,
-                    "prompt": data.get("prompt"),
-                    "lyrics": data.get("lyrics"),
-                    "tags": data.get("tags"),
-                    **data,
-                }
-            ).encode("utf-8"),
-        )
-
-        # 等待 Worker 回复（超时 3 分钟）
-        msg = await nc.request(reply_subject, b"", timeout=180.0)
+        msg = await nc.request("ai.generate", payload, timeout=180.0)
         result = json.loads(msg.data.decode("utf-8"))
 
         return JSONResponse(content=result)
@@ -65,4 +67,4 @@ async def generate(request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=3000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=3000, reload=True)
