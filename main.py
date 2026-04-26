@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict  # ← 关键：新增 ConfigDict
+from pydantic import BaseModel, ConfigDict
 import uvicorn
 import os
 from dotenv import load_dotenv
@@ -8,19 +8,17 @@ import nats
 import json
 import uuid
 from loguru import logger
+import asyncio
 
 load_dotenv()
 
 app = FastAPI(title="Local AI Coordinator - 本地测试版", version="0.1.0")
 
 
-# ================== Pydantic v2 正确写法（关键修复）==================
 class GenerateRequest(BaseModel):
     prompt: str = "中文流行，情感，男声，钢琴"
     lyrics: str = "夜雨敲打着东京的窗\n霓虹灯下我一个人彷徨"
     tags: str = "chinese pop, emotional, male vocal, piano"
-
-    # Pydantic v2 正确配置方式
     model_config = ConfigDict(extra="allow")
 
 
@@ -44,6 +42,11 @@ async def generate(req: GenerateRequest):
     try:
         nc = await get_nats()
 
+        # ================== 1. 订阅唯一的结果通道（pub/sub 核心）==================
+        result_subject = f"ai.results.{request_id}"
+        sub = await nc.subscribe(result_subject, max_msgs=1)
+
+        # ================== 2. 构造 payload 并发布任务 ==================
         payload = json.dumps(
             {
                 "request_id": request_id,
@@ -54,11 +57,27 @@ async def generate(req: GenerateRequest):
             }
         ).encode("utf-8")
 
-        msg = await nc.request("ai.generate", payload, timeout=180.0)
+        await nc.publish("ai.generate", payload)
+        logger.info(f"[{request_id}] 任务已 publish 到 ai.generate")
+
+        # ================== 3. 等待结果 ==================
+        msg = await sub.next_msg(timeout=180.0)  # 与原来 180 秒一致
         result = json.loads(msg.data.decode("utf-8"))
+
+        await sub.unsubscribe()  # 清理
 
         return JSONResponse(content=result)
 
+    except asyncio.TimeoutError:
+        logger.warning(f"[{request_id}] 超时")
+        return JSONResponse(
+            status_code=504,
+            content={
+                "status": "timeout",
+                "request_id": request_id,
+                "message": "生成超时",
+            },
+        )
     except Exception as e:
         logger.error(f"[{request_id}] 处理失败: {e}")
         return JSONResponse(
